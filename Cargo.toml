@@ -1,0 +1,32 @@
+[package]
+name = "google-maps-generator-rs"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "map-generator"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4.4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+indicatif = { version = "0.18", features = ["rayon"] }
+pollster = "0.3"
+rayon = "1.8"
+webp  = "0.3.1"
+wgpu  = "27"
+
+# Optional AVIF support – requires NASM.  Enable with: cargo build --features avif
+ravif = { version = "0.11", optional = true }
+rgb   = { version = "0.8", optional = true }
+
+[features]
+avif = ["dep:ravif", "dep:rgb"]
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+strip = true
