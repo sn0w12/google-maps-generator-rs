@@ -13,6 +13,7 @@ mod app {
 
     fn sample_source_image() -> RgbaImage {
         RgbaImage::from_fn(2048, 2048, |x, y| {
+            let r = (x & 0xff) as u8;
             let g = (y & 0xff) as u8;
             let b = ((x ^ y) & 0xff) as u8;
             let a = 255;
