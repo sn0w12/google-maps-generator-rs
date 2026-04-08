@@ -22,6 +22,9 @@ wgpu  = "27"
 ravif = { version = "0.11", optional = true }
 rgb   = { version = "0.8", optional = true }
 
+[dev-dependencies]
+criterion = "0.8.2"
+
 [features]
 avif = ["dep:ravif", "dep:rgb"]
 
@@ -30,3 +33,7 @@ opt-level = 3
 lto = true
 panic = "abort"
 strip = true
+
+[[bench]]
+name = "bench"
+harness = false

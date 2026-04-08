@@ -530,7 +530,7 @@ impl GpuTileRenderer {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, clap::ValueEnum)]
-enum OutputFormat {
+pub enum OutputFormat {
     /// WebP (lossy)
     Webp,
     /// JPEG (no alpha channel; alpha is stripped)
@@ -627,7 +627,7 @@ fn make_square(img: &DynamicImage, bg: (u8, u8, u8, u8)) -> RgbaImage {
 // ---------------------------------------------------------------------------
 
 /// Encode a single RGBA tile to the requested format and return the raw bytes.
-fn encode_tile(img: RgbaImage, format: OutputFormat, quality: u32) -> Result<Vec<u8>> {
+pub fn encode_tile(img: RgbaImage, format: OutputFormat, quality: u32) -> Result<Vec<u8>> {
     match format {
         OutputFormat::Webp => {
             let dynamic = DynamicImage::ImageRgba8(img);
