@@ -9,10 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const TILE_SIZE: u32 = 256;
-/// Number of tiles rendered per GPU submission. Larger batches amortise the
-/// per-submit overhead and keep the GPU fed; the CPU then WebP-encodes the
-/// batch in parallel on all cores before moving to the next batch.
-const BATCH_SIZE: usize = 64;
+/// Floor for the dynamically-computed GPU batch size.
+const MIN_BATCH_SIZE: usize = 64;
+/// Ceiling for the dynamically-computed GPU batch size; prevents excessive
+/// command-buffer recording overhead at very high tile counts.
+const MAX_BATCH_SIZE: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // WGSL shader: renders a tile-sized quad by sampling a UV sub-region of the
@@ -102,10 +103,15 @@ struct GpuTileRenderer {
     blit_sampler:    wgpu::Sampler,          // bilinear, clamp
     /// One render-target texture per batch slot.
     output_textures: Vec<wgpu::Texture>,
-    /// One host-readable staging buffer per batch slot.
-    output_buffers:  Vec<wgpu::Buffer>,
-    /// One uniform buffer per batch slot (holds TileUniforms for that tile).
-    uniform_buffers: Vec<wgpu::Buffer>,
+    /// Single staging buffer large enough for all tiles in one batch.
+    output_buffer:   wgpu::Buffer,
+    /// Single uniform buffer; per-tile data is written at `i * uniform_align` offsets.
+    uniform_buffer:  wgpu::Buffer,
+    /// Minimum dynamic-offset alignment (device limit, typically 256).
+    uniform_align:   u32,
+    /// Number of tiles per GPU submission, computed at initialisation from
+    /// the adapter's maximum buffer size.
+    batch_size:      usize,
 }
 
 impl GpuTileRenderer {
@@ -126,8 +132,29 @@ impl GpuTileRenderer {
             })
             .await.ok()?;
 
+        // Compute optimal batch size from the adapter's reported maximum buffer
+        // size.  We target at most 25 % of that limit for the staging readback
+        // buffer, clamped between MIN_BATCH_SIZE and MAX_BATCH_SIZE.
+        let tile_bytes      = (TILE_SIZE * TILE_SIZE * 4) as u64;
+        let adapter_max_buf = adapter.limits().max_buffer_size;
+        let batch_size      = ((adapter_max_buf / 4) / tile_bytes)
+            .clamp(MIN_BATCH_SIZE as u64, MAX_BATCH_SIZE as u64) as usize;
+        let staging_buf_size = batch_size as u64 * tile_bytes;
+
+        // Request the device with max_buffer_size large enough to hold the
+        // staging buffer (stays within the adapter's own reported limit).
+        let required_max_buf = staging_buf_size
+            .max(wgpu::Limits::default().max_buffer_size)
+            .min(adapter_max_buf);
+
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: wgpu::Limits {
+                    max_buffer_size: required_max_buf,
+                    ..wgpu::Limits::default()
+                },
+                ..Default::default()
+            })
             .await
             .ok()?;
 
@@ -142,8 +169,10 @@ impl GpuTileRenderer {
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty:         wgpu::BindingType::Buffer {
                         ty:                 wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size:   None,
+                        has_dynamic_offset: true,
+                        min_binding_size:   std::num::NonZeroU64::new(
+                            std::mem::size_of::<TileUniforms>() as u64,
+                        ),
                     },
                     count: None,
                 },
@@ -267,7 +296,10 @@ impl GpuTileRenderer {
             ..Default::default()
         });
 
-        // BATCH_SIZE render-target textures, staging buffers and uniform buffers.
+        // Per-device alignment for dynamic uniform buffer offsets (typically 256 bytes).
+        let uniform_align = device.limits().min_uniform_buffer_offset_alignment;
+
+        // One render-target texture per batch slot.
         let mk_output_tex = || device.create_texture(&wgpu::TextureDescriptor {
             label:           None,
             size:            wgpu::Extent3d { width: TILE_SIZE, height: TILE_SIZE, depth_or_array_layers: 1 },
@@ -278,23 +310,26 @@ impl GpuTileRenderer {
             usage:           wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats:    &[],
         });
-        // 256 * 4 = 1024 bytes per row — already 256-byte aligned (wgpu requirement).
-        let mk_staging_buf = || device.create_buffer(&wgpu::BufferDescriptor {
+
+        // Single staging buffer large enough for all tiles in one batch.
+        // 256 * 256 * 4 = 262_144 bytes per tile; offset is already 256-byte aligned.
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label:              None,
-            size:               (TILE_SIZE * TILE_SIZE * 4) as u64,
+            size:               staging_buf_size,
             usage:              wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mk_uniform_buf = || device.create_buffer(&wgpu::BufferDescriptor {
+
+        // Single uniform buffer with dynamic-offset slots.  Each slot is
+        // `uniform_align` bytes wide; the first 16 bytes hold TileUniforms.
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label:              None,
-            size:               std::mem::size_of::<TileUniforms>() as u64,
+            size:               batch_size as u64 * uniform_align as u64,
             usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let output_textures: Vec<_> = (0..BATCH_SIZE).map(|_| mk_output_tex()).collect();
-        let output_buffers:  Vec<_> = (0..BATCH_SIZE).map(|_| mk_staging_buf()).collect();
-        let uniform_buffers: Vec<_> = (0..BATCH_SIZE).map(|_| mk_uniform_buf()).collect();
+        let output_textures: Vec<_> = (0..batch_size).map(|_| mk_output_tex()).collect();
 
         Some(Self {
             device,
@@ -306,8 +341,10 @@ impl GpuTileRenderer {
             sampler,
             blit_sampler,
             output_textures,
-            output_buffers,
-            uniform_buffers,
+            output_buffer,
+            uniform_buffer,
+            uniform_align,
+            batch_size,
         })
     }
 
@@ -411,39 +448,49 @@ impl GpuTileRenderer {
         tiles:  &[(u32, u32, u32)], // (x, y, num_tiles)
     ) -> Vec<RgbaImage> {
         let n = tiles.len();
-        assert!(n <= BATCH_SIZE);
+        assert!(n <= self.batch_size);
 
-        // Write per-tile uniforms and build bind groups.
-        let bind_groups: Vec<wgpu::BindGroup> = tiles
-            .iter()
-            .enumerate()
-            .map(|(i, &(x, y, num_tiles))| {
-                let inv = 1.0 / num_tiles as f32;
-                let u   = TileUniforms {
-                    uv_offset: [x as f32 * inv, y as f32 * inv],
-                    uv_scale:  [inv, inv],
-                };
-                self.queue.write_buffer(&self.uniform_buffers[i], 0, bytemuck::bytes_of(&u));
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label:   None,
-                    layout:  &self.tile_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding:  0,
-                            resource: self.uniform_buffers[i].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding:  1,
-                            resource: wgpu::BindingResource::TextureView(&source.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding:  2,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                })
-            })
-            .collect();
+        let align      = self.uniform_align as usize;
+        let tile_bytes = (TILE_SIZE * TILE_SIZE * 4) as usize;
+
+        // Pack all per-tile uniforms into one upload (one write_buffer call).
+        let mut uniform_data = vec![0u8; n * align];
+        for (i, &(x, y, num_tiles)) in tiles.iter().enumerate() {
+            let inv = 1.0 / num_tiles as f32;
+            let u   = TileUniforms {
+                uv_offset: [x as f32 * inv, y as f32 * inv],
+                uv_scale:  [inv, inv],
+            };
+            let slot = &mut uniform_data[i * align..i * align + std::mem::size_of::<TileUniforms>()];
+            slot.copy_from_slice(bytemuck::bytes_of(&u));
+        }
+        self.queue.write_buffer(&self.uniform_buffer, 0, &uniform_data);
+
+        // One bind group for the whole batch; dynamic offset selects per-tile uniform.
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   None,
+            layout:  &self.tile_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding:  0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.uniform_buffer,
+                        offset: 0,
+                        size:   std::num::NonZeroU64::new(
+                            std::mem::size_of::<TileUniforms>() as u64,
+                        ),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  1,
+                    resource: wgpu::BindingResource::TextureView(&source.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
 
         // Record all draw + copy commands in a single encoder.
         let mut encoder =
@@ -458,8 +505,8 @@ impl GpuTileRenderer {
                     color_attachments:        &[Some(wgpu::RenderPassColorAttachment {
                         view:           &out_view,
                         resolve_target: None,
-                    depth_slice:    None,
-                    ops:            wgpu::Operations {
+                        depth_slice:    None,
+                        ops:            wgpu::Operations {
                             load:  wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
@@ -469,9 +516,11 @@ impl GpuTileRenderer {
                     occlusion_query_set:      None,
                 });
                 rp.set_pipeline(&self.tile_pipeline);
-                rp.set_bind_group(0, &bind_groups[i], &[]);
+                // Dynamic offset selects slot i in the shared uniform buffer.
+                rp.set_bind_group(0, &bind_group, &[(i * align) as u32]);
                 rp.draw(0..4, 0..1);
             }
+            // Copy tile into its region of the single staging buffer.
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
                     texture:   &self.output_textures[i],
@@ -480,9 +529,9 @@ impl GpuTileRenderer {
                     aspect:    wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyBufferInfo {
-                    buffer: &self.output_buffers[i],
+                    buffer: &self.output_buffer,
                     layout: wgpu::TexelCopyBufferLayout {
-                        offset:         0,
+                        offset:         (i * tile_bytes) as u64,
                         bytes_per_row:  Some(TILE_SIZE * 4),
                         rows_per_image: None,
                     },
@@ -498,30 +547,29 @@ impl GpuTileRenderer {
         // One submit for the whole batch.
         self.queue.submit([encoder.finish()]);
 
-        // Kick off all N async map requests, then wait once.
-        let receivers: Vec<_> = (0..n)
-            .map(|i| {
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.output_buffers[i]
-                    .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-                rx
-            })
-            .collect();
+        // Single map request covering the entire staging buffer.
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.output_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
 
         let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        rx.recv().unwrap().unwrap();
 
-        // Collect pixel data.
-        (0..n)
-            .map(|i| {
-                receivers[i].recv().unwrap().unwrap();
-                let data = self.output_buffers[i].slice(..).get_mapped_range();
-                let img  = RgbaImage::from_raw(TILE_SIZE, TILE_SIZE, data.to_vec()).unwrap();
-                drop(data);
-                self.output_buffers[i].unmap();
-                img
-            })
-            .collect()
+        // Extract per-tile images from the mapped buffer, then unmap once.
+        let images: Vec<RgbaImage> = {
+            let mapped = self.output_buffer.slice(..).get_mapped_range();
+            (0..n)
+                .map(|i| {
+                    let start = i * tile_bytes;
+                    let end   = start + tile_bytes;
+                    RgbaImage::from_raw(TILE_SIZE, TILE_SIZE, mapped[start..end].to_vec()).unwrap()
+                })
+                .collect()
+        };
+        self.output_buffer.unmap();
+
+        images
     }
 }
 
@@ -638,9 +686,11 @@ pub fn encode_tile(img: RgbaImage, format: OutputFormat, quality: u32) -> Result
         OutputFormat::Jpg => {
             // JPEG has no alpha channel; discard it by converting to RGB.
             let rgb = DynamicImage::ImageRgba8(img).to_rgb8();
-            let mut buf = Vec::new();
+            // Pre-allocate a reasonable output buffer; encode directly from raw
+            // bytes to avoid re-wrapping in DynamicImage.
+            let mut buf = Vec::with_capacity(TILE_SIZE as usize * TILE_SIZE as usize / 2);
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality as u8)
-                .encode_image(&DynamicImage::ImageRgb8(rgb))?;
+                .encode(rgb.as_raw(), TILE_SIZE, TILE_SIZE, image::ExtendedColorType::Rgb8)?;
             Ok(buf)
         }
         #[cfg(feature = "avif")]
@@ -699,29 +749,55 @@ fn process_zoom_gpu(
     pb.set_message(zoom.to_string());
 
     // Collect all (x, y) pairs and process them in batches.
-    // Each batch: one GPU submission (N draw + N copy), one poll,
-    // then all N tiles are WebP-encoded in parallel on CPU.
     let all_tiles: Vec<(u32, u32)> = (0..num_tiles)
         .flat_map(|x| (0..num_tiles).map(move |y| (x, y)))
         .collect();
 
-    for chunk in all_tiles.chunks(BATCH_SIZE) {
+    // Pipeline GPU rendering with CPU encoding via a bounded channel.
+    // Capacity 1 means the GPU can render one batch ahead of the encoder,
+    // so GPU and CPU work overlaps almost completely when encoding is the
+    // bottleneck.  If the GPU is slower, backpressure naturally throttles it.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<RgbaImage>, Vec<(u32, u32)>)>(1);
+
+    let zoom_dir2 = zoom_dir.clone();
+    let pb2       = pb.clone();
+
+    // Encoder thread: drains the channel and encodes batches in parallel.
+    let enc_thread = std::thread::spawn(move || -> Result<()> {
+        while let Ok((images, chunk)) = rx.recv() {
+            chunk
+                .par_iter()
+                .zip(images.into_par_iter())
+                .try_for_each(|(&(x, y), img)| -> Result<()> {
+                    let encoded = encode_tile(img, format, quality)?;
+                    fs::write(
+                        zoom_dir2
+                            .join(x.to_string())
+                            .join(format!("{}.{}", y, format.ext())),
+                        &encoded,
+                    )?;
+                    pb2.inc(1);
+                    Ok(())
+                })?;
+        }
+        Ok(())
+    });
+
+    // Main thread: renders batches and hands them off; GPU is free to start
+    // the next batch as soon as render_batch returns, while the encoder
+    // thread is still processing the previous one.
+    for chunk in all_tiles.chunks(renderer.batch_size) {
         let specs: Vec<(u32, u32, u32)> =
             chunk.iter().map(|&(x, y)| (x, y, num_tiles)).collect();
         let images = renderer.render_batch(source, &specs);
-
-        // Encode + write in parallel on all CPU cores.
-        chunk
-            .par_iter()
-            .zip(images.into_par_iter())
-            .try_for_each(|(&(x, y), img)| -> Result<()> {
-                let x_dir    = zoom_dir.join(x.to_string());
-                let encoded  = encode_tile(img, format, quality)?;
-                fs::write(x_dir.join(format!("{}.{}", y, format.ext())), &encoded)?;
-                pb.inc(1);
-                Ok(())
-            })?;
+        tx.send((images, chunk.to_vec()))
+            .map_err(|_| anyhow::anyhow!("encoder thread panicked"))?;
     }
+    drop(tx); // Signal the encoder thread that no more batches are coming.
+
+    enc_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("encoder thread panicked"))??;
 
     pb.finish_with_message(format!("{} done", zoom));
     Ok(())
@@ -811,7 +887,7 @@ fn main() -> Result<()> {
 
     match GpuTileRenderer::try_new() {
         Some(renderer) => {
-            println!("GPU acceleration active.");
+            println!("GPU acceleration active (batch size: {} tiles).", renderer.batch_size);
             let source = renderer.upload_source(&rgba_img);
             for zoom in args.min_zoom..=args.max_zoom {
                 process_zoom_gpu(&renderer, &source, zoom, &args.output, args.quality, args.format)?;
